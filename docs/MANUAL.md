@@ -1036,6 +1036,259 @@ mechanism above rather than working around it:
    converging) but cheapest to just try given how fast a good result
    appeared last time (2 epochs, not 100+).
 
+### 12.15 Acting on item 3: Focal Tversky loss
+
+v7 was stopped after 10 epochs -- ten straight of `building`/`flooded`
+collapse, and `road` itself starting to degrade (F1 0.394 -> 0.182,
+coverage dropping to 41/87 at epoch 10), a genuinely worse trend than
+letting it continue was likely to reverse on its own.
+
+Implemented item 3 from S12.14: `TverskyLoss` gained an optional
+`focal_gamma` parameter (`(1 - TI) ** (1/gamma)` per class, applied
+before the existing `class_weights` averaging -- Abraham & Khan 2018).
+Where `class_weights` reweights which CLASS the loss prioritizes, this
+additionally reweights which PIXELS within that class it prioritizes,
+concentrating gradient on ones the model still gets wrong rather than
+ones it's already confident about -- a genuinely different lever than
+anything tried so far, not a rename of an existing one. `focal_gamma=1.0`
+(default) is the identity power, exact prior behavior, verified by test.
+`train.py --focal-gamma` wires it through. 3 new regression tests,
+including one that isolates the focal term's effect on a genuine
+partial-credit prediction (neither perfect nor total failure), where the
+difference actually shows up.
+
+Training restarted an eighth time (`training_log_geoformer_801_v8.csv`)
+combining every fix so far plus `--focal-gamma 2.0` (the original paper's
+typical range is 1-3; 2.0 is the middle of it, not yet tuned against this
+specific problem).
+
+**Result, real and negative**: `focal_gamma=2.0` collapsed FASTER than
+any prior configuration -- `building` and `flooded` both fully gone
+(0.000, zero coverage) by epoch 2-3, compared to epoch 3-4 in every
+config without it.
+
+| epoch | building F1 (cov) | road F1 (cov) | flooded F1 (cov) |
+|---|---|---|---|
+| 1 | 0.420 (78/87) | 0.295 (85/87) | 0.137 (85/87) |
+| 2 | 0.002 (6/87) | 0.305 (80/87) | 0.000 (0/87) |
+| 3 | 0.000 (0/87) | 0.366 (80/87) | 0.000 (0/87) |
+
+A plausible mechanism, stated as reasoning rather than proven: the focal
+term's whole design amplifies gradient on pixels a model is already
+struggling with -- exactly the collapsed classes' own pixels, once they
+start slipping. Instead of pulling the model back toward predicting
+them, that extra gradient magnitude may have pushed it faster toward the
+same degenerate background+road-only solution the un-focused loss
+reaches more slowly. Stopped after 3 epochs rather than let a
+demonstrably-worse trend continue -- this is useful negative evidence
+for the next attempt (a lower gamma, or focal weighting applied only to
+the ALREADY-boosted classes rather than uniformly across all four), not
+a dead end to just retry unchanged.
+
+### 12.16 Geometric augmentation (D4): a genuinely untried lever, not a variant of one already tried
+
+Every configuration attempted so far (v1-v8) shared one thing in common:
+**zero data augmentation**. Every real tile was shown to the model in
+exactly one fixed orientation, every epoch, for the project's entire
+history. Satellite/aerial imagery has no canonical "up" -- a building
+rotated 90 degrees is still a building, a flooded road mirrored is still
+a flooded road -- so this was real, unused headroom, and a genuinely
+different kind of lever than anything tried in S12.5-S12.15 (all of
+which changed how the loss or sampler weighted existing tiles, never
+what the tiles themselves looked like).
+
+`dataset.py`'s `SpaceNet8Dataset` gained `augment: bool = False` (default
+preserves exact prior behavior). When enabled, `_augment_tile()` applies
+a random dihedral-group (D4) transform -- horizontal flip, vertical
+flip, and a 0/90/180/270-degree rotation, each independently chosen --
+identically to the pre-event image, post-event image, AND mask, so the
+three stay spatially aligned. The mask specifically uses NEAREST
+resampling on rotation (not left to PIL's default for its image mode),
+since any interpolation between adjacent class indices would fabricate
+a label value that was never in the real GeoJSON data. `train.py
+--augment` wires it through -- a second `SpaceNet8Dataset` instance
+backs the TRAIN split only (val keeps seeing each tile in its one real
+orientation, so held-out numbers stay comparable epoch to epoch;
+sharing one instance between both splits was rejected specifically to
+avoid coupling that choice). 3 new regression tests verify the
+transform preserves image size, applies identically across all three
+images (checked via a corner marker present in all three, asserted to
+land in the same output coordinates regardless of which random
+transform got picked, run across 30 trials to exercise every code
+path), and never introduces a mask value that wasn't in the original.
+
+Training restarted a ninth time (`training_log_geoformer_801_v9.csv`)
+dropping the focal term back to its default (`focal_gamma=1.0`, given
+S12.15's negative result) and adding `--augment` to the rest of the
+stack (pretrained backbone, oversampling, class-weighted loss, backbone
+freezing, `min_f1` checkpoint selection).
+
+**First 3 epochs, real and mixed**:
+
+| epoch | building F1 (cov) | road F1 (cov) | flooded F1 (cov) |
+|---|---|---|---|
+| 1 | 0.365 (81/87) | 0.209 (86/87) | 0.069 (86/87) |
+| 2 | 0.432 (52/87) | 0.268 (86/87) | **0.187 (80/87)** — best flooded coverage of any run so far |
+| 3 | 0.000 (0/87) | 0.295 (82/87) | 0.000 (0/87) |
+
+Augmentation improved epoch-2 quality specifically (`flooded`'s best F1
+AND best coverage of the entire project, beating v5's epoch-2 0.144 and
+v7's epoch-1 0.137) but did **not** delay or prevent the epoch-3 collapse
+itself — same timing as every from-scratch-augmentation run before it.
+Read plainly: augmentation appears to raise the ceiling of what the
+model reaches before collapsing, without addressing why it collapses at
+all. Consistent with, not contradicting, the S12.10/S12.13 synthesis
+that the joint 4-way softmax's class competition is the actual
+mechanism -- better features (pretrained backbone) and better-conditioned
+training (augmentation) both raise the peak; neither has yet changed
+whether the peak holds.
+
+`docs/EXTERNAL_DATA_PLAN.md` names the next data-side lever (external
+building-footprint data) along with explicit trigger conditions for when
+to actually build it -- not now, since S12.14's architecture-level fix
+(a separate flood head) hasn't been tried yet and would need to be ruled
+out first before concluding this is a data-volume problem rather than an
+architecture one.
+
+### 12.17 Debugging the collapse mechanism directly, not just its symptoms
+
+Every section above establishes *that* building/flooded collapse happens
+and *when*. This section is the first to actually look *inside* a
+collapsed checkpoint to find out *how*, with three short, targeted
+tests against v9's own live checkpoint (epoch 3, the collapsed one) --
+not guessed, measured.
+
+**Test 1 -- is it gradient instability?** Ran 60 real training steps
+(same sampler, same loss config, backbone frozen to match v9's own
+epoch 1-3 state) logging the per-step gradient norm before any optimizer
+update. Result: stable throughout, 0.04-0.29, no spikes, no correlation
+with which classes were present in that step's tile. **Ruled out**:
+gradient clipping would have nothing to clip here.
+
+**Test 2 -- is the model narrowly losing the argmax, or has it truly
+abandoned the class?** Loaded the actual collapsed checkpoint
+(`checkpoints/last.pt`, epoch 3) and evaluated its raw softmax
+probability at every real building-labeled pixel of a genuine
+building-containing held-out tile (2,476 real building pixels). Result:
+mean predicted `building` probability = **0.0000** (max across all
+2,476 pixels: 0.0001); mean `background` probability at those same
+pixels = 0.9699. This is not a close competition the model is
+narrowly losing -- it has confidently, near-totally eliminated
+`building` as a possibility everywhere, including on pixels it was
+literally shown are buildings.
+
+**Test 3 -- is this a dead output channel (shallow, cheaply fixable) or
+a deeper representational collapse?** Inspected the Geo-Head's final
+1x1 conv layer's actual weights per class, on the same checkpoint:
+
+| class | bias | weight norm |
+|---|---|---|
+| background | +0.611 | 2.569 |
+| building | -0.337 | 1.596 |
+| road | -0.202 | 1.326 |
+| flooded | -0.104 | 1.725 |
+
+`building`'s output weights are NOT degenerate -- a norm of 1.6 is
+substantial, not a dead/zeroed channel, and the bias gap to background
+(~0.95) is far too small on its own to explain a probability of
+0.0000 vs 0.97. The near-total collapse must therefore come from
+**upstream**: the shared 32-channel decoder features feeding into this
+layer no longer contain a discriminative signal for `building` that this
+weight vector can act on, at least not at the pixels that matter.
+Background's own output weight vector has the LARGEST norm of all four
+classes AND the most favorable bias -- consistent with the shared
+representation itself having been shaped disproportionately around
+recognizing background (present in effectively every pixel of every
+tile) at the expense of the rarer classes' own discriminative features.
+
+**What this rules out and what it strengthens, concretely**: not
+gradient instability (Test 1), not a shallow/cheaply-reinitializable
+output-layer problem (Test 3) -- both would have been quick wins if
+true, and neither is. What remains consistent with all three tests is
+the S12.10/S12.13 synthesis: a single joint softmax, with one dominant
+background-like class and several rare ones sharing the SAME upstream
+representation, lets the dominant class's training signal reshape that
+shared representation around itself. A separate, decoupled output head
+for the rare classes (S12.14 item 1) would give them their own gradient
+pathway into a representation that doesn't have to also serve
+background's overwhelming pixel-count advantage -- this debugging pass
+is real evidence FOR that fix, not just a restatement of the plan.
+
+### 12.18 Implementing the separate flood head (S12.14 item 1)
+
+Acted directly on S12.17's evidence. `GeoFormerConfig` gained a
+`separate_flood_head: bool = False` field. When set, `DualAxisGeoFormer`
+replaces the single 4-class `geo_head` with a shared `split_trunk`
+feeding two independent final layers: `structure_head` (3-way,
+background/building/road) and `flood_head` (1-channel binary). Each
+gets its own weights, so `flooded`'s gradient no longer has to share a
+representation -- or an output layer -- with the classes S12.17 showed
+are crowding it out. `forward()` still returns a synthesized 4-channel
+`out["logits"]` (`cat([structure_logits, flood_logit])`) purely for
+backward compatibility with `evaluate.py`/`demo.py`/`serve.py`/
+`ConfusionAccumulator`/the dashboard, none of which needed to change.
+
+**Backward compatibility, deliberately protected**: the default
+(`separate_flood_head=False`) path's `geo_head` module is untouched,
+byte-for-byte the same `nn.Sequential` as before this feature existed --
+verified by a test that checks `hasattr(model, "geo_head")` is true and
+`hasattr(model, "structure_head"/"flood_head"/"split_trunk")` is false
+on the default path. This was caught as a bug in my own first draft:
+an earlier version renamed the shared trunk to `geo_trunk` on BOTH
+paths, which would have silently broken `load_state_dict` for every
+checkpoint saved before this change (key mismatch, e.g.
+`geo_head.0.weight` vs `geo_trunk.0.weight`). Fixed before any test ran.
+
+**Loss side**: `TverskyLoss.forward()` gained an optional `valid_mask`
+parameter -- pixels where it's `False` are excluded from every
+tp/fp/fn sum entirely, not diluted. This matters specifically for the
+structure loss: a pixel labeled `flooded` in the ground truth has no
+recoverable label for what its underlying structure (building/road/
+background) actually was -- the original rasterization already
+overwrote that information (see docs/EXTERNAL_DATA_PLAN.md for what
+recovering it would take, out of scope here). Guessing a fallback
+class for those pixels would be actively wrong training signal;
+excluding them via `valid_mask=(mask != 3)` is the honest choice.
+Verified by a test that a masked pixel, even made maximally wrong,
+produces byte-identical loss to the same tensor with that pixel
+physically removed -- not just "small effect", genuinely zero.
+
+`train.py` wiring: a new `--separate-flood-head` flag constructs two
+`TverskyLoss` instances (structure: `num_classes=3`; flood:
+`num_classes=2`, treated as background-vs-flooded binary via
+`cat([-flood_logit, flood_logit])`), reusing the run's existing
+`--tversky-alpha/beta`/`--focal-gamma` and splitting `--class-weights`
+across both (`[:3]` for structure, `[1.0, w_flooded]` for flood). A
+`compute_loss(out, mask)` helper isolates the branch so train and val
+loops share identical combination logic -- `structure_loss(structure_
+target=mask.clamp(max=2), valid_mask=mask!=3) + flood_loss(target=
+mask==3)`.
+
+**Testing**: 6 new tests (4 in `tests/test_model.py`, 2 in
+`tests/test_losses.py`) -- shape correctness, the backward-compat
+`hasattr` check, gradient flow to both new heads independently, the
+4-class-only guard rejecting `separate_flood_head=True` with
+`num_classes != 4`, `valid_mask=None` matching prior behavior exactly,
+and the masked-pixel-contributes-zero proof. Full suite: 57 passed
+(`python -m pytest tests/ -q`), including a real end-to-end smoke test
+of `train.py --separate-flood-head` on synthetic data (ran, logged a
+checkpoint, no crash; that smoketest run was deleted from the
+Postgres `training_runs`/`epoch_logs` tables afterward so it doesn't
+pollute the dashboard's real experiment history).
+
+**Status**: implemented and tested, not yet validated on real data.
+v9 (augmentation, no separate head) was stopped at epoch 4 -- its log
+confirms the collapse pattern is exactly as settled as S12.16 already
+documented (`val_f1_building=0.0`, `val_f1_flooded=0.0` at both epoch
+3 and 4) -- freeing the GPU for v10, which combines this fix with the
+rest of the proven stack (pretrained backbone, oversampling,
+class-weighted loss, D4 augmentation, `min_f1` checkpoint selection,
+backbone freezing). v10's first several epochs are the real test of
+whether S12.17's hypothesis holds: if `flooded`/`building` F1 stays
+nonzero past epoch 3 with a separate head, the collapse was indeed a
+shared-representation problem, not something the loss/backbone/
+augmentation levers alone could fix.
+
 ## 13. Bottlenecks, honestly, and how to actually overcome each one
 
 Four real bottlenecks were hit while building this, in this environment
