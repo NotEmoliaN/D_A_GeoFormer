@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.pytest_cache/
+
+# Regenerable / heavy — see README + docs/MANUAL.md for how to recreate these
+checkpoints/
+real_sn8/
+real_sn8_dataset/
+real_sn8_preview/
+*.pt
+*.pth
+data/
+results/
+checkpoints_baseline/
+real_sn8_dataset_full/
+
+# Dashboard: DB credentials and user-submitted images never get committed
+.env
+dashboard/sample_uploads/

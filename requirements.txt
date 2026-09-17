@@ -1,0 +1,12 @@
+torch>=2.0
+numpy
+scipy
+scikit-image
+matplotlib
+pillow
+fastapi
+uvicorn[standard]
+python-multipart
+pytest
+psycopg2-binary
+timm
