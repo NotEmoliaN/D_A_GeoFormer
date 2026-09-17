@@ -74,6 +74,36 @@ def per_class_f1(logits: torch.Tensor, target: torch.Tensor, num_classes: int, e
     return f1s
 
 
+def checkpoint_score(metric: str, val_loss: float, f1_final: dict) -> float:
+    """Lower is always better, whichever metric is chosen, so a single
+    min()-based comparison drives checkpoint selection regardless.
+
+    WHY THIS EXISTS (docs/MANUAL.md S12.12): val_loss-based "best"
+    selection was found, concretely, to prefer a COLLAPSED checkpoint
+    over a genuinely useful one. Tversky loss is dominated by whichever
+    classes have the most pixels (background, then road); a model that
+    stops predicting building/flooded at all can have a LOWER val_loss
+    than one that predicts them imperfectly but for real -- confirmed on
+    this exact project's own v5 run: epoch 2 (building F1 0.49, flooded
+    F1 0.14, both with real per-image coverage) had val_loss 0.686;
+    epoch 5 (building/flooded both exactly 0.000, totally collapsed) had
+    val_loss 0.370 -- LOWER, so epoch 5 became "best.pt" and epoch 2's
+    weights were never saved as best and are now gone. 'mean_f1' and
+    'min_f1' score checkpoints by what this project actually cares about
+    (balanced multi-class detection, not just loss magnitude) instead.
+    """
+    if metric == "val_loss":
+        return val_loss
+    f1_values = [v for v in f1_final.values() if v is not None]
+    if not f1_values:
+        return float("inf")  # no class has appeared in gt or pred yet -- nothing to score
+    if metric == "mean_f1":
+        return -(sum(f1_values) / len(f1_values))
+    if metric == "min_f1":
+        return -min(f1_values)
+    raise ValueError(f"Unknown --checkpoint-metric '{metric}'")
+
+
 class ConfusionAccumulator:
     """Accumulates raw TP/FP/FN counts (and per-image class coverage) across
     an entire validation/evaluation pass, so F1 is computed ONCE from the
@@ -197,6 +227,14 @@ def main():
                          "batch's forward/backward instead of doing both serially. Pure wall-clock "
                          "speedup, no effect on what gets trained -- try min(4, os.cpu_count()-1) "
                          "or so; ignored for the synthetic dataset (cheap enough in-process).")
+    p.add_argument("--checkpoint-metric", type=str, default="val_loss",
+                    choices=["val_loss", "mean_f1", "min_f1"],
+                    help="What 'best.pt' tracks. 'val_loss' (default, exact prior behavior) can "
+                         "prefer a collapsed checkpoint over a genuinely useful one -- see "
+                         "docs/MANUAL.md S12.12. 'mean_f1' maximizes the average per-class F1 "
+                         "across classes seen so far; 'min_f1' maximizes the WORST class's F1 "
+                         "(the strictest anti-collapse choice -- a checkpoint can't be 'best' "
+                         "while any seen class is at 0).")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--checkpoint-every", type=int, default=10,
                     help="Save a non-overwritten epoch_N.pt snapshot every N epochs, independent "
@@ -220,6 +258,13 @@ def main():
                          "more often per epoch than their raw prevalence. Targets the "
                          "building/flooded total-collapse finding in docs/MANUAL.md S12.3-S13 "
                          "-- val stays unweighted so evaluation numbers stay honest.")
+    p.add_argument("--freeze-backbone-epochs", type=int, default=0,
+                    help="geoformer + --pretrained-backbone only: freeze the pretrained backbone's "
+                         "weights for this many epochs before unfreezing. Standard transfer-learning "
+                         "practice -- less backward-pass compute and activation memory while frozen "
+                         "(the backbone runs under torch.no_grad()), and protects the pretrained "
+                         "ImageNet features from early, noisy gradients from an untrained decoder/head. "
+                         "0 (default) never freezes -- exact prior behavior.")
     p.add_argument("--pretrained-backbone", type=str, default=None,
                     help="geoformer only: an ImageNet-pretrained timm model name (e.g. "
                          "'efficientnet_b0') supporting features_only=True at strides "
@@ -266,7 +311,7 @@ def main():
     start_epoch = 0
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_val_loss = float("inf")
+    best_score = float("inf")
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -306,12 +351,18 @@ def main():
         # otherwise this is a regime change and "best" starts over.
         ckpt_data_source = ckpt.get("data_source")
         current_data_source = args.data_dir if args.data_dir else "synthetic"
-        if ckpt_data_source == current_data_source:
-            best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+        # Same regime-change logic as data_source above, extended to the
+        # checkpoint metric: a best_score computed as -mean_f1 is not
+        # comparable to one computed as val_loss, so only inherit it when
+        # BOTH data_source and checkpoint_metric match this run's.
+        ckpt_metric = ckpt.get("checkpoint_metric", "val_loss")  # older checkpoints predate this field
+        if ckpt_data_source == current_data_source and ckpt_metric == args.checkpoint_metric:
+            best_score = ckpt.get("best_score", best_score)
         else:
-            print(f"Resumed checkpoint's data_source ('{ckpt_data_source}') differs from this run's "
-                  f"('{current_data_source}') -- treating this as a new regime, best_val_loss restarts at inf "
-                  f"instead of inheriting a value that isn't comparable.")
+            print(f"Resumed checkpoint's (data_source='{ckpt_data_source}', metric='{ckpt_metric}') differs "
+                  f"from this run's (data_source='{current_data_source}', metric='{args.checkpoint_metric}') "
+                  f"-- treating this as a new regime, best_score restarts at inf instead of inheriting a "
+                  f"value that isn't comparable.")
         print(f"Resumed from {args.resume} at epoch {start_epoch}, lr reset to {args.lr:.2e}")
 
     # T_max is the REMAINING epoch count, not args.epochs -- a fresh
@@ -355,6 +406,15 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         model.train()
+        # model.train() above puts every submodule (including the backbone)
+        # back into train() mode -- re-apply the freeze state (which also
+        # forces the backbone specifically back to eval()) every epoch,
+        # not just once, or an epoch boundary would silently undo it.
+        if args.model == "geoformer" and args.pretrained_backbone:
+            should_freeze = epoch < args.freeze_backbone_epochs
+            if epoch == start_epoch or should_freeze != (epoch - 1 < args.freeze_backbone_epochs):
+                print(f"Backbone {'frozen' if should_freeze else 'unfrozen'} (epoch {epoch + 1})")
+            model.encoder.set_backbone_frozen(should_freeze)
         train_loss_sum, n_batches = 0.0, 0
         for pre, post, mask in train_loader:
             pre, post, mask = pre.to(device), post.to(device), mask.to(device)
@@ -423,7 +483,9 @@ def main():
             # unpickle arbitrary classes (including our own GeoFormerConfig).
             # SN8Baseline has no config dataclass -- None for that model type.
             "config_dict": dataclasses.asdict(model.cfg) if args.model == "geoformer" else None,
-            "val_loss": val_loss, "best_val_loss": min(best_val_loss, val_loss),
+            "val_loss": val_loss,
+            "checkpoint_metric": args.checkpoint_metric,
+            "best_score": min(best_score, checkpoint_score(args.checkpoint_metric, val_loss, f1_final)),
             # BUG THIS FIXES: nothing previously recorded whether a checkpoint
             # was trained on real or synthetic data, or which real dataset --
             # a script showing a checkpoint's results had no reliable way to
@@ -433,10 +495,11 @@ def main():
             "data_source": args.data_dir if args.data_dir else "synthetic",
         }
         torch.save(ckpt_payload, ckpt_dir / "last.pt")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        score = checkpoint_score(args.checkpoint_metric, val_loss, f1_final)
+        if score < best_score:
+            best_score = score
             torch.save(ckpt_payload, ckpt_dir / "best.pt")
-            print(f"  -> new best (val_loss={val_loss:.4f}), saved {ckpt_dir / 'best.pt'}")
+            print(f"  -> new best ({args.checkpoint_metric}, score={score:.4f}), saved {ckpt_dir / 'best.pt'}")
         # BUG THIS FIXES: last.pt is overwritten every single epoch and
         # best.pt only updates when val_loss improves -- so a run that goes
         # through one genuinely bad epoch (a bad --resume lr, an aggressive
@@ -454,8 +517,8 @@ def main():
             torch.save(ckpt_payload, milestone_path)
             print(f"  -> milestone snapshot saved {milestone_path}")
 
-    print(f"\n{args.log_csv} is up to date (written every epoch). Best val_loss: {best_val_loss:.4f}. "
-          f"Checkpoints in {ckpt_dir}/ (best.pt, last.pt).")
+    print(f"\n{args.log_csv} is up to date (written every epoch). Best {args.checkpoint_metric} "
+          f"score: {best_score:.4f}. Checkpoints in {ckpt_dir}/ (best.pt, last.pt).")
 
 
 if __name__ == "__main__":
