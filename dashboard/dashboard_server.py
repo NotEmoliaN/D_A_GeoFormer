@@ -196,7 +196,47 @@ def config():
     """Tells the frontend what this deployment can actually do, so it can
     hide/disable the upload form instead of offering something that will
     fail -- see IS_VERCEL above."""
-    return JSONResponse({"uploads_enabled": not IS_VERCEL})
+    return JSONResponse({"uploads_enabled": not IS_VERCEL, "test_status_enabled": not IS_VERCEL})
+
+
+@app.get("/api/test-status")
+def test_status():
+    """Runs the real pytest suite on demand and reports the real result --
+    genuine test stats, not a cached/fabricated badge. On-demand rather
+    than polled: the suite takes ~10-15s, too slow to run every dashboard
+    refresh tick. Disabled on Vercel (no pytest/torch in that deployment's
+    deliberately lightweight dependency set -- see api/requirements.txt)."""
+    if IS_VERCEL:
+        raise HTTPException(501, "Test status isn't available on this deployment -- run locally.")
+    import re
+    import subprocess
+    import time
+    from datetime import datetime, timezone
+
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            ["python", "-m", "pytest", "tests/", "-q", "--tb=no"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Could not run the test suite: {e}")
+
+    output = result.stdout + result.stderr
+    m = re.search(r"(\d+) passed(?:, (\d+) failed)?", output)
+    passed = int(m.group(1)) if m else None
+    failed = int(m.group(2)) if m and m.group(2) else 0
+    m_failed_only = re.search(r"(\d+) failed", output)
+    if m_failed_only and not m:
+        failed = int(m_failed_only.group(1))
+
+    return JSONResponse({
+        "passed": passed, "failed": failed,
+        "total": (passed or 0) + failed,
+        "exit_code": result.returncode,
+        "duration_seconds": round(time.time() - t0, 1),
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @app.get("/api/dataset")
@@ -264,23 +304,53 @@ async def submit_sample(pre: UploadFile = File(...), post: UploadFile = File(...
     with post_path.open("wb") as f:
         shutil.copyfileobj(post.file, f)
 
+    # Live inference, right here in the request -- not a "submit now, run
+    # `process_samples.py` manually later" batch job. Best-effort: any
+    # failure (no checkpoint yet, a corrupt image, an OOM on a huge upload)
+    # leaves the sample 'pending' with the real error recorded, rather than
+    # failing the whole upload -- `python dashboard/process_samples.py`
+    # remains a working fallback/backfill path for exactly that case.
+    status, checkpoint_used, result_json, result_image, error_message = "pending", None, None, None, None
+    try:
+        from dashboard.inference import run_inference, CHECKPOINT_PATH  # noqa: PLC0415
+        result_json, png_bytes = run_inference(pre_path, post_path, CHECKPOINT_PATH)
+        overlay_path = SAMPLES_DIR / f"{sample_uuid}_overlay.png"
+        overlay_path.write_bytes(png_bytes)
+        status = "processed"
+        checkpoint_used = str(CHECKPOINT_PATH)
+        result_image = str(overlay_path.relative_to(BASE_DIR))
+    except FileNotFoundError:
+        error_message = f"No checkpoint at {os.environ.get('GEOFORMER_CHECKPOINT', 'checkpoints/best.pt')} yet"
+    except Exception as e:  # noqa: BLE001 - live inference must never break the upload itself
+        error_message = str(e)
+
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO samples (pre_filename, post_filename, status)
-            VALUES (%s, %s, 'pending') RETURNING id
+            INSERT INTO samples (pre_filename, post_filename, status, checkpoint_used,
+                                  result_json, result_image, error_message, processed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s = 'processed' THEN now() ELSE NULL END)
+            RETURNING id
             """,
-            (str(pre_path.relative_to(BASE_DIR)), str(post_path.relative_to(BASE_DIR))),
+            (str(pre_path.relative_to(BASE_DIR)), str(post_path.relative_to(BASE_DIR)), status,
+             checkpoint_used, json.dumps(result_json) if result_json else None, result_image,
+             error_message, status),
         )
         sample_id = cur.fetchone()[0]
         conn.commit()
     finally:
         conn.close()
 
-    return JSONResponse({"sample_id": sample_id, "status": "pending",
-                          "note": "Saved. Run `python dashboard/process_samples.py` to run inference on pending samples."})
+    if status == "processed":
+        note = "Live detection complete."
+    else:
+        note = (f"Saved, but live detection couldn't run ({error_message}). "
+                 "Run `python dashboard/process_samples.py` once a checkpoint is available.")
+    return JSONResponse({"sample_id": sample_id, "status": status, "result": result_json,
+                          "result_image": f"/uploads/{Path(result_image).name}" if result_image else None,
+                          "note": note})
 
 
 @app.get("/api/samples")
@@ -295,6 +365,18 @@ def list_samples():
             for key in ("submitted_at", "processed_at"):
                 if row.get(key) is not None:
                     row[key] = row[key].isoformat()
+            # BUG THIS FIXES: result_image is stored as a filesystem path
+            # relative to BASE_DIR (e.g. "dashboard/sample_uploads/x.png"),
+            # not a URL -- the /uploads mount below serves SAMPLES_DIR's
+            # contents at /uploads/<filename>, a different prefix entirely.
+            # Handing the raw DB value straight to the frontend's <img src>
+            # produced a real 404/broken image (confirmed in-browser: the
+            # gallery rendered a broken-image icon, requesting
+            # /dashboard/sample_uploads/... instead of /uploads/...) even
+            # though POST /api/samples's own response already did this
+            # conversion correctly -- the two endpoints had silently drifted.
+            if row.get("result_image"):
+                row["result_image"] = f"/uploads/{Path(row['result_image']).name}"
             rows.append(row)
         return JSONResponse(rows)
     finally:

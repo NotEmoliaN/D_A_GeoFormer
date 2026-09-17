@@ -128,6 +128,8 @@
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
   .tab-enter { animation: tabRise .28s cubic-bezier(.2,.7,.3,1) both; }
   @keyframes tabRise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .flash-update { animation: flashUpdate 1.1s ease; }
+  @keyframes flashUpdate { 0% { box-shadow: 0 0 0 2px var(--accent); } 100% { box-shadow: 0 0 0 0px transparent; } }
   .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .card h2 {
     font: 600 12px/1 var(--font-display); text-transform: uppercase; letter-spacing: .08em;
@@ -163,6 +165,14 @@
   .ok { color: var(--good); font-weight: 600; }
   .note { font-size: 12px; color: var(--text-faint); margin-top: 10px; line-height: 1.55; }
   .note code { font-family: var(--font-mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+
+  .samples-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; max-height: 560px; overflow-y: auto; }
+  .sample-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .sample-card img { width: 100%; display: block; aspect-ratio: 9 / 4; object-fit: cover; background: var(--panel); }
+  .sample-card-placeholder { width: 100%; aspect-ratio: 9 / 4; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 11.5px; background: var(--panel); }
+  .sample-card-meta { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px 0; }
+  .sample-card-date { font-size: 10.5px; color: var(--text-faint); }
+  .sample-card-result { padding: 4px 10px 10px; font-size: 11.5px; color: var(--text-faint); text-transform: capitalize; }
 
   /* ---------- charts ---------- */
   .chart-wrap { position: relative; }
@@ -285,6 +295,16 @@
 
     <div class="grid">
       <div class="card wide">
+        <div class="card-head">
+          <h2>Test suite <span class="dim">real pytest run, on demand</span></h2>
+          <button class="primary" id="runTestsBtn" style="padding:6px 14px;font-size:11.5px">Run tests now</button>
+        </div>
+        <div id="testStatusCard"><div class="note">Not run yet this session &mdash; click "Run tests now" for the real, current result.</div></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card wide">
         <div class="card-head"><h2>Quick view <span class="dim">latest logged epoch per run</span></h2></div>
         <div class="table-wrap">
           <table id="quickViewTable">
@@ -384,7 +404,9 @@
   <section id="tab-samples" hidden>
     <div class="grid cols-2">
       <div class="card">
-        <h2>Submit new sample</h2>
+        <h2>Submit new sample <span class="dim">live detection</span></h2>
+        <p class="desc">Upload a pre-event / post-event image pair. Inference runs immediately against
+          the current best checkpoint &mdash; no manual step, the result appears below the form.</p>
         <div id="uploadsDisabledNote" class="note" hidden>
           Uploads aren't available on this deployment (no persistent storage here) &mdash;
           run the dashboard locally to submit new samples. See <code>docs/VERCEL_DEPLOYMENT.md</code>.
@@ -392,19 +414,17 @@
         <form id="sampleForm">
           <div class="dropzone"><label>Pre-event image <input type="file" name="pre" accept="image/*" required></label></div>
           <div class="dropzone"><label>Post-event image <input type="file" name="post" accept="image/*" required></label></div>
-          <button type="submit" class="primary">Upload pair</button>
+          <button type="submit" class="primary">Detect now</button>
         </form>
         <div id="sampleStatus"></div>
-        <div class="note">Saved as <code>pending</code> &mdash; run <code>python dashboard/process_samples.py</code> to run inference.</div>
+        <div id="liveResult" hidden style="margin-top:14px">
+          <img id="liveResultImg" style="width:100%; border-radius:10px; border:1px solid var(--border)">
+          <div id="liveResultClasses" style="margin-top:8px; font-size:12.5px; color:var(--text-faint)"></div>
+        </div>
       </div>
       <div class="card">
-        <div class="card-head"><h2>Recent samples</h2></div>
-        <div class="table-wrap">
-          <table id="samplesTable">
-            <thead><tr><th>ID</th><th>Status</th><th>Submitted</th><th>Result</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div class="card-head"><h2>Recent samples</h2><span class="count" id="samplesGalleryCount"></span></div>
+        <div id="samplesGallery" class="samples-gallery"></div>
       </div>
     </div>
   </section>
@@ -826,26 +846,34 @@ async function loadDataset() {
 }
 
 /* ---------------- Samples tab ---------------- */
+function sampleResultSummary(r) {
+  if (r.result_json) {
+    const present = Object.entries(r.result_json.pixel_counts || {}).filter(([, n]) => n > 0).map(([k]) => k);
+    return present.join(', ') || 'background only';
+  }
+  return esc(r.error_message) || '&mdash;';
+}
+
 async function loadSamples() {
   const rows = await fetchJSON('/api/samples');
   document.getElementById('samplesCount').textContent = rows.length ? `(${rows.length})` : '';
-  const tbody = document.querySelector('#samplesTable tbody');
-  tbody.innerHTML = '';
+  document.getElementById('samplesGalleryCount').textContent = rows.length ? `(${rows.length})` : '';
+  const gallery = document.getElementById('samplesGallery');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-faint); font-family:var(--font-body)">No samples submitted yet.</td></tr>';
+    gallery.innerHTML = '<div class="note">No samples submitted yet.</div>';
     return;
   }
-  rows.forEach(r => {
-    const tr = document.createElement('tr');
-    const result = r.result_json
-      ? (Object.entries(r.result_json.pixel_counts || {}).filter(([, n]) => n > 0).map(([k]) => k).join(', ') || 'background only')
-      : (esc(r.error_message) || '&mdash;');
-    tr.innerHTML = `<td>#${r.id}</td>
-      <td><span class="pill status-${esc(r.status)}">${esc(r.status)}</span></td>
-      <td>${new Date(r.submitted_at).toLocaleString()}</td>
-      <td>${result}</td>`;
-    tbody.appendChild(tr);
-  });
+  gallery.innerHTML = rows.map(r => `
+    <div class="sample-card">
+      ${r.result_image
+        ? `<img src="${esc(r.result_image)}" alt="detection result for sample #${r.id}" loading="lazy">`
+        : `<div class="sample-card-placeholder">${r.status === 'failed' ? 'inference failed' : 'no image yet'}</div>`}
+      <div class="sample-card-meta">
+        <span class="pill status-${esc(r.status)}">${esc(r.status)}</span>
+        <span class="sample-card-date">${new Date(r.submitted_at).toLocaleString()}</span>
+      </div>
+      <div class="sample-card-result">${sampleResultSummary(r)}</div>
+    </div>`).join('');
 }
 
 document.getElementById('sampleForm').addEventListener('submit', async (e) => {
@@ -853,10 +881,20 @@ document.getElementById('sampleForm').addEventListener('submit', async (e) => {
   const fd = new FormData(e.target);
   const btn = e.target.querySelector('button');
   btn.disabled = true;
-  document.getElementById('sampleStatus').textContent = 'Uploading…';
+  document.getElementById('sampleStatus').textContent = 'Running live detection…';
+  document.getElementById('liveResult').hidden = true;
   try {
     const res = await fetchJSON('/api/samples', { method: 'POST', body: fd });
-    document.getElementById('sampleStatus').innerHTML = `<span class="ok">&#10003;</span> Saved as sample #${res.sample_id} (pending).`;
+    if (res.status === 'processed' && res.result_image) {
+      document.getElementById('sampleStatus').innerHTML = `<span class="ok">&#10003;</span> Sample #${res.sample_id}: ${esc(res.note)}`;
+      const img = document.getElementById('liveResultImg');
+      img.src = res.result_image + '?t=' + Date.now();
+      const present = Object.entries(res.result.pixel_counts || {}).filter(([, n]) => n > 0).map(([k]) => k);
+      document.getElementById('liveResultClasses').textContent = 'Detected: ' + (present.join(', ') || 'background only');
+      document.getElementById('liveResult').hidden = false;
+    } else {
+      document.getElementById('sampleStatus').innerHTML = `<span class="flag">Sample #${res.sample_id}:</span> ${esc(res.note)}`;
+    }
     e.target.reset();
     loadSamples();
   } catch (err) {
@@ -880,8 +918,99 @@ async function loadConfig() {
       document.getElementById('sampleForm').hidden = true;
       document.getElementById('uploadsDisabledNote').hidden = false;
     }
+    if (!cfg.test_status_enabled) {
+      document.getElementById('runTestsBtn').disabled = true;
+      document.getElementById('testStatusCard').innerHTML =
+        '<div class="note">Test status isn\'t available on this deployment (no pytest/torch here) &mdash; run locally.</div>';
+    }
   } catch (e) { /* older deployment without /api/config -- uploads assumed enabled */ }
 }
+
+document.getElementById('runTestsBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runTestsBtn');
+  const card = document.getElementById('testStatusCard');
+  btn.disabled = true;
+  card.innerHTML = '<div class="note">Running the real test suite&hellip; (~10-15s)</div>';
+  try {
+    const r = await fetchJSON('/api/test-status');
+    const ok = r.exit_code === 0;
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <span class="pill status-${ok ? 'ok' : 'collapsed'}" style="font-size:12.5px;padding:5px 12px">
+          ${ok ? '✓' : '✗'} ${r.passed}/${r.total} passing
+        </span>
+        <span class="note" style="margin:0">ran in ${r.duration_seconds}s &middot; ${new Date(r.ran_at).toLocaleString()}</span>
+      </div>`;
+    flashUpdated(card);
+  } catch (err) {
+    card.innerHTML = `<div class="note"><span class="flag">Failed to run:</span> ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ---------------- real-time auto-refresh ---------------- */
+// Epochs land roughly every 6-10 minutes for this project's own training
+// runs, so a 20s poll is responsive without hammering the DB -- and it's
+// cheap: /api/runs and /api/stats/best are both small aggregate queries,
+// and the active run's epoch list only actually changes once real
+// training progress lands (getEpochs' cache is invalidated explicitly
+// below, not on every poll, so an unchanged run costs nothing extra).
+const REFRESH_MS = 20000;
+let lastRefreshAt = Date.now();
+
+function flashUpdated(el) {
+  if (!el) return;
+  el.classList.remove('flash-update'); void el.offsetWidth; el.classList.add('flash-update');
+}
+
+function updateRefreshIndicator() {
+  const secs = Math.round((Date.now() - lastRefreshAt) / 1000);
+  const el = document.getElementById('liveLabel');
+  if (el && el.textContent !== 'offline') el.textContent = `live · updated ${secs}s ago`;
+}
+
+async function refreshTick() {
+  let freshRuns, freshBest;
+  try {
+    [freshRuns, freshBest] = await Promise.all([fetchJSON('/api/runs'), fetchJSON('/api/stats/best').catch(() => null)]);
+    setLive(true);
+  } catch (e) {
+    setLive(false);
+    return;
+  }
+  lastRefreshAt = Date.now();
+
+  // Did the actively-selected run gain a new epoch since the last poll?
+  const activeRow = document.querySelector('#runsTable tbody tr.active');
+  const activeId = activeRow ? activeRow.dataset.runId : null;
+  const before = runsData.find(r => String(r.id) === String(activeId));
+  const after = freshRuns.find(r => String(r.id) === String(activeId));
+  const activeRunGrew = before && after && after.last_epoch !== before.last_epoch;
+
+  runsData = freshRuns;
+  renderRunsTable();
+  if (activeId) document.querySelector(`#runsTable tbody tr[data-run-id="${activeId}"]`)?.classList.add('active');
+  document.getElementById('statRuns').textContent = runsData.length;
+  if (freshBest) { renderHeroStats(freshBest); flashUpdated(document.getElementById('statRow')); }
+  renderActivityFeed();
+  renderQuickView();
+  analyticsRendered = false; // next Analytics visit re-fetches with fresh epoch data
+
+  if (activeRunGrew && activeId) {
+    delete epochsCache[activeId];           // force a real re-fetch, not the stale cache
+    await loadRunCharts(activeId, after.run_name, after.notes);
+    flashUpdated(document.getElementById('tab-training'));
+    if (String(activeId) === String(runsData[runsData.length - 1]?.id)) {
+      getEpochs(activeId).then(rows => renderLatestRunCard(after, rows));
+      flashUpdated(document.getElementById('latestRunCard'));
+    }
+  }
+  loadSamples();
+}
+
+setInterval(refreshTick, REFRESH_MS);
+setInterval(updateRefreshIndicator, 1000);
 
 loadConfig();
 loadRuns();
